@@ -24,13 +24,16 @@ load_dotenv(project_root / ".env")
 
 PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
 
-if not PINECONE_API_KEY:
-    raise ValueError("Missing PINECONE_API_KEY in .env")
+# Vector store backend: PINECONE (cloud, default) or FAISS (local files, no account needed)
+VECTOR_DB = os.getenv("VECTOR_DB", "PINECONE").strip().upper()
 
-# Set up clean production data cache path
+if VECTOR_DB == "PINECONE" and not PINECONE_API_KEY:
+    raise ValueError("Missing PINECONE_API_KEY in .env (or set VECTOR_DB=FAISS to use a local index)")
+
+# Set up clean production data cache path (separate cache per backend so switching never skips files)
 cache_dir = project_root / "data" / "cache"
 cache_dir.mkdir(parents=True, exist_ok=True)
-HASH_CACHE_FILE = cache_dir / "ingestion_hash_cache.json"
+HASH_CACHE_FILE = cache_dir / ("faiss_hash_cache.json" if VECTOR_DB == "FAISS" else "ingestion_hash_cache.json")
 
 hash_cache = {}
 if HASH_CACHE_FILE.exists():
@@ -66,30 +69,35 @@ else:
 # ==========================================
 # 3. PINECONE PROVISIONING
 # ==========================================
-print(f"Connecting to Pinecone Index Target: [{INDEX_NAME}]...")
-pc = Pinecone(api_key=PINECONE_API_KEY)
+FAISS_DIR = project_root / "data" / "vector_store" / INDEX_NAME
 
-existing_indexes = pc.list_indexes().names()
+if VECTOR_DB == "FAISS":
+    print(f"📁 Local FAISS index target: [{FAISS_DIR}]")
+else:
+    print(f"Connecting to Pinecone Index Target: [{INDEX_NAME}]...")
+    pc = Pinecone(api_key=PINECONE_API_KEY)
 
-# Self-healing verification in case an index was created with a wrong legacy dimension
-if INDEX_NAME in existing_indexes:
-    desc = pc.describe_index(INDEX_NAME)
-    if desc.dimension != TARGET_DIMENSION:
-        print(f"⚠️ Fixing tracking: Purging mismatched {desc.dimension} dim index...")
-        pc.delete_index(INDEX_NAME)
-        existing_indexes = [name for name in existing_indexes if name != INDEX_NAME]
+    existing_indexes = pc.list_indexes().names()
 
-if INDEX_NAME not in existing_indexes:
-    print(f"Creating isolated target index: {INDEX_NAME} ({TARGET_DIMENSION} Dim)...")
-    pc.create_index(
-        name=INDEX_NAME,
-        dimension=TARGET_DIMENSION, 
-        metric="cosine",
-        spec=ServerlessSpec(cloud="aws", region="us-east-1")
-    )
+    # Self-healing verification in case an index was created with a wrong legacy dimension
+    if INDEX_NAME in existing_indexes:
+        desc = pc.describe_index(INDEX_NAME)
+        if desc.dimension != TARGET_DIMENSION:
+            print(f"⚠️ Fixing tracking: Purging mismatched {desc.dimension} dim index...")
+            pc.delete_index(INDEX_NAME)
+            existing_indexes = [name for name in existing_indexes if name != INDEX_NAME]
 
-index_client = pc.Index(INDEX_NAME)
-vector_store = PineconeVectorStore(index_name=INDEX_NAME, embedding=embeddings)
+    if INDEX_NAME not in existing_indexes:
+        print(f"Creating isolated target index: {INDEX_NAME} ({TARGET_DIMENSION} Dim)...")
+        pc.create_index(
+            name=INDEX_NAME,
+            dimension=TARGET_DIMENSION,
+            metric="cosine",
+            spec=ServerlessSpec(cloud="aws", region="us-east-1")
+        )
+
+    index_client = pc.Index(INDEX_NAME)
+    vector_store = PineconeVectorStore(index_name=INDEX_NAME, embedding=embeddings)
 
 # ==========================================
 # 4. ROBUST POLYMORPHIC PARSER
@@ -167,6 +175,50 @@ for pattern in target_patterns:
 
 print(f"Found {len(current_files)} policy file(s) in {policy_dir}...")
 
+# ------------------------------------------
+# 5a. LOCAL FAISS PATH
+# FAISS has no metadata-filtered delete, so when any policy file is added, changed
+# or removed we rebuild the whole local index (fine for a handful of SOP files).
+# ------------------------------------------
+if VECTOR_DB == "FAISS":
+    from langchain_community.vectorstores import FAISS
+
+    current_hashes = {name: hashlib.md5(path.read_bytes()).hexdigest() for name, path in current_files.items()}
+    if current_hashes == hash_cache and (FAISS_DIR / "index.faiss").exists():
+        print("🌴 Local FAISS index is already up-to-date.")
+        raise SystemExit(0)
+
+    all_chunks, all_ids = [], []
+    for file_name, file_path in current_files.items():
+        print(f"🔄 Processing: {file_name}...")
+        chunks = parse_and_chunk_document(file_path)
+        if not chunks:
+            print(f"  ⚠️ No valid text chunks extracted from {file_name}.")
+            current_hashes.pop(file_name, None)
+            continue
+        for idx, chunk in enumerate(chunks):
+            chunk.metadata["source_file"] = file_name
+            chunk.metadata["file_format"] = file_path.suffix.replace(".", "").upper()
+            chunk.metadata["document_type"] = "Compliance Asset"
+            all_ids.append(f"{file_name}-chunk-{idx}")
+        all_chunks.extend(chunks)
+
+    if not all_chunks:
+        raise ValueError(f"No text chunks found in {policy_dir}; nothing to index.")
+
+    print(f"  📤 Embedding {len(all_chunks)} chunk(s) into local FAISS index...")
+    faiss_store = FAISS.from_documents(all_chunks, embeddings, ids=all_ids)
+    FAISS_DIR.mkdir(parents=True, exist_ok=True)
+    faiss_store.save_local(str(FAISS_DIR))
+
+    with open(HASH_CACHE_FILE, "w") as f:
+        json.dump(current_hashes, f, indent=4)
+    print(f"✅ FAISS index saved to {FAISS_DIR}")
+    raise SystemExit(0)
+
+# ------------------------------------------
+# 5b. PINECONE PATH (incremental upserts)
+# ------------------------------------------
 updated_cache = {}
 cache_modified = False
 

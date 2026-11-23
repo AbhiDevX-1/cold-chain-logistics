@@ -45,8 +45,11 @@ db_port = os.getenv("SQL_SERVER_PORT", "1433")
 db_user = os.getenv("SQL_AGENT_USER", "USR_FDE_RO")
 db_password = os.getenv("SQL_AGENT_PASSWORD")
 
-if not PINECONE_API_KEY:
-    raise ValueError("CRITICAL: Ensure PINECONE_API_KEY is present in your active .env profile.")
+# Vector store backend: PINECONE (cloud, default) or FAISS (local files built by scripts/ingest_sop_pinecone.py)
+VECTOR_DB = os.getenv("VECTOR_DB", "PINECONE").strip().upper()
+
+if VECTOR_DB == "PINECONE" and not PINECONE_API_KEY:
+    raise ValueError("CRITICAL: Ensure PINECONE_API_KEY is present in your active .env profile (or set VECTOR_DB=FAISS).")
 
 if EMBEDDINGS_MODEL_SETTING == "OPENAI":
     print("🤖 Mode: Connecting to Cloud OpenAI Index (1536 Dim Space)...")
@@ -70,7 +73,16 @@ else :
 
     INDEX_NAME = "fde-sop-index-local"
 
-vector_store = PineconeVectorStore(index_name=INDEX_NAME, embedding=embeddings)
+if VECTOR_DB == "FAISS":
+    from langchain_community.vectorstores import FAISS
+    faiss_dir = project_root / "data" / "vector_store" / INDEX_NAME
+    if not (faiss_dir / "index.faiss").exists():
+        raise FileNotFoundError(f"No local FAISS index at {faiss_dir}. Run: python scripts/ingest_sop_pinecone.py")
+    print(f"📁 Vector DB: Local FAISS index [{faiss_dir.name}]")
+    # The index is a file this project builds itself, so loading its pickled docstore is safe.
+    vector_store = FAISS.load_local(str(faiss_dir), embeddings, allow_dangerous_deserialization=True)
+else:
+    vector_store = PineconeVectorStore(index_name=INDEX_NAME, embedding=embeddings)
 retriever = vector_store.as_retriever(search_kwargs={"k": 2})
 
 # ==========================================
@@ -84,7 +96,9 @@ def query_telemetry_db(sql_query: str) -> str:
     Columns available:
     Timestamp, Latitude, Longitude, Current_Temperature_C, Cargo_Condition_Code,
     Risk_Classification, Delay_Probability, Port_Congestion_Level, Route_Risk_Index.
-    Always write standard T-SQL queries.
+    Always write standard T-SQL queries (use TOP N, never LIMIT).
+    For a location, filter with a +/- 0.5 degree box and put the smaller number first in BETWEEN,
+    e.g. near (33.8, -118.1): Latitude BETWEEN 33.3 AND 34.3 AND Longitude BETWEEN -118.6 AND -117.6
     """
     connection_string = (
             f"DRIVER={{ODBC Driver 18 for SQL Server}};"

@@ -56,7 +56,8 @@ elif AGENT_LLM_SETTING == "DEEPSEEK":
 
 else:  # FALLBACK / DEFAULT RUNNER MODE
     print("🤗 Brain Mode: Local Fallback Activated. Binding Local Ollama (qwen2.5:7b)...")
-    from langchain_community.chat_models import ChatOllama
+    # ChatOllama was removed from langchain_community; langchain-ollama is the maintained package with tool calling
+    from langchain_ollama import ChatOllama
     llm = ChatOllama(model="qwen2.5:7b", temperature=0, num_predict=1024)
 
 fde_tools = [query_telemetry_db, fetch_corridor_conditions, search_compliance_sop]
@@ -65,8 +66,20 @@ llm_with_tools = llm.bind_tools(fde_tools)
 # ==========================================
 # 3. GRAPH ARCHITECTURE ASSEMBLY
 # ==========================================
+# Load the business-structured system prompt once, so every entry point (CLI loop and Streamlit UI) uses it
+PROMPT_PATH = project_root / "src" / "prompts" / "system_prompt.txt"
+try:
+    SYSTEM_PROMPT = SystemMessage(content=PROMPT_PATH.read_text(encoding="utf-8"))
+except FileNotFoundError:
+    print(f"Error: Could not find {PROMPT_PATH}")
+    SYSTEM_PROMPT = SystemMessage(content="You are a helpful AI assistant.")  # Basic fallback
+
 def reasoning_node(state: AgentState):
-    response = llm_with_tools.invoke(state["messages"])
+    messages = state["messages"]
+    # Prepend the system prompt for the model call if the conversation doesn't already start with one
+    if not messages or not isinstance(messages[0], SystemMessage):
+        messages = [SYSTEM_PROMPT] + list(messages)
+    response = llm_with_tools.invoke(messages)
     return {"messages": [response]}
 
 print("⚙️ Compiling LangGraph FDE Orchestrator...")
@@ -89,20 +102,9 @@ if __name__ == "__main__":
     print(f"   Configured Execution: [LLM: {AGENT_LLM_SETTING}] -> [Embeddings: {os.getenv('Embeddings_model', 'LOCAL')}]")
     print("="*55 + "\n")
     
-    # Load the business-structured system prompt from the external file
-    prompt_path = project_root / "src" / "prompts" / "system_prompt.txt"
-    try:
-        with open(prompt_path, "r", encoding="utf-8") as f:
-            system_instructions = f.read()
-    except FileNotFoundError:
-        print(f"Error: Could not find {prompt_path}")
-        system_instructions = "You are a helpful AI assistant." # Basic fallback
-
-    system_prompt = SystemMessage(content=system_instructions)
-    
+    # The system prompt is injected by reasoning_node, so the loop only sends user messages
     thread_config = {"configurable": {"thread_id": "production_test_1"}}
-    fde_agent.invoke({"messages": [system_prompt]}, config=thread_config)
-    
+
     while True:
         user_input = input("\nDispatcher > ")
         if user_input.lower() in ['exit', 'quit']:
